@@ -1,0 +1,111 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function account() {
+      return get(
+        /databases/$(database)/documents/users/$(request.auth.uid)
+      ).data;
+    }
+
+    function isTeacher() {
+      return signedIn() &&
+        account().get('role', '') == 'teacher';
+    }
+
+    function isStudent() {
+      return signedIn() &&
+        account().get('role', '') == 'student';
+    }
+
+    function isOwnStudent(studentId) {
+      return isStudent() &&
+        (
+          account().get('studentId', '') == studentId ||
+          get(
+            /databases/$(database)/documents/students/$(studentId)
+          ).data.get('email', '') == request.auth.token.email
+        );
+    }
+
+    function validStudentAttendanceCreate() {
+      let student = get(
+        /databases/$(database)/documents/students/$(request.resource.data.studentId)
+      ).data;
+      let session = get(
+        /databases/$(database)/documents/sessions/$(request.resource.data.sessionId)
+      ).data;
+
+      let studentType = student.get('studentType', 'Student');
+      let expectedStatus = studentType == 'Student'
+          ? session.get('defaultStatus', 'Present')
+          : studentType;
+
+      return isStudent()
+        && isOwnStudent(request.resource.data.studentId)
+        && request.resource.data.authUid == request.auth.uid
+        && request.resource.data.selfScanned == true
+        && request.resource.data.scanMethod == 'student_session_qr'
+        && request.resource.id == request.resource.data.studentId + '_' + request.resource.data.date
+        && session.get('type', '') == 'attendance_session'
+        && session.get('active', false) == true
+        && session.get('expiresAt', request.time) > request.time
+        && session.get('createdBy', '') != ''
+        && get(
+          /databases/$(database)/documents/users/$(session.get('createdBy', ''))
+        ).data.get('role', '') == 'teacher'
+        && request.resource.data.sessionId == session.get('sessionId', '')
+        && request.resource.data.date == session.get('date', '')
+        && request.resource.data.classId == session.get('classId', '')
+        && request.resource.data.program == student.get('program', '')
+        && request.resource.data.year == student.get('year', '')
+        && request.resource.data.section == student.get('section', '')
+        && session.get('program', '') == student.get('program', '')
+        && session.get('year', '') == student.get('year', '')
+        && session.get('section', '') == student.get('section', '')
+        && request.resource.data.attendanceStatus == expectedStatus;
+    }
+
+    match /users/{uid} {
+      allow read: if signedIn() && request.auth.uid == uid;
+      allow create, update, delete: if false;
+    }
+
+    match /students/{studentId} {
+      allow read: if isTeacher() || isOwnStudent(studentId);
+      allow create, update, delete: if isTeacher();
+    }
+
+    match /sessions/{sessionId} {
+      allow read: if isTeacher() || (
+        isStudent() &&
+        resource.data.get('active', false) == true &&
+        resource.data.get('expiresAt', request.time) > request.time
+      );
+
+      allow create: if isTeacher()
+        && request.resource.data.get('createdBy', '') == request.auth.uid
+        && request.resource.data.get('type', '') == 'attendance_session';
+
+      allow update: if isTeacher()
+        && resource.data.get('createdBy', '') == request.auth.uid;
+
+      allow delete: if false;
+    }
+
+    match /attendance/{docId} {
+      allow read: if isTeacher() || (
+        isStudent() && isOwnStudent(resource.data.get('studentId', ''))
+      );
+
+      allow create: if isTeacher() || validStudentAttendanceCreate();
+
+      allow update, delete: if false;
+    }
+  }
+}
