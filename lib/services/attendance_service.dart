@@ -21,12 +21,12 @@ class SessionQrPayload {
   });
 
   String toJson() => jsonEncode({
-        'version': version,
-        'type': type,
-        'sessionId': sessionId,
-        'date': date,
-        'classId': classId,
-      });
+    'version': version,
+    'type': type,
+    'sessionId': sessionId,
+    'date': date,
+    'classId': classId,
+  });
 
   static SessionQrPayload parse(String raw) {
     final decoded = jsonDecode(raw);
@@ -85,14 +85,11 @@ class AttendanceSessionClass {
   });
 
   String get label {
-    final yearDigits =
-        RegExp(r'^\d+').firstMatch(year)?.group(0) ?? year;
+    final yearDigits = RegExp(r'^\d+').firstMatch(year)?.group(0) ?? year;
     return '$program $yearDigits-$section';
   }
 
-  AttendanceSessionClass copyWith({
-    int? studentCount,
-  }) {
+  AttendanceSessionClass copyWith({int? studentCount}) {
     return AttendanceSessionClass(
       classId: classId,
       program: program,
@@ -109,7 +106,7 @@ class ActiveAttendanceSession {
   final String program;
   final String year;
   final String section;
-  final String status;
+  final int presentWindowMinutes;
   final DateTime createdAt;
 
   const ActiveAttendanceSession({
@@ -118,7 +115,7 @@ class ActiveAttendanceSession {
     required this.program,
     required this.year,
     required this.section,
-    required this.status,
+    required this.presentWindowMinutes,
     required this.createdAt,
   });
 
@@ -135,20 +132,24 @@ class ActiveAttendanceSession {
 
 class AttendanceSession {
   final SessionQrPayload payload;
+  final DateTime createdAt;
   final DateTime expiresAt;
   final String program;
   final String year;
   final String section;
-  final String defaultStatus;
+  final int presentWindowMinutes;
+  final int lateWindowMinutes;
   final String createdBy;
 
   const AttendanceSession({
     required this.payload,
+    required this.createdAt,
     required this.expiresAt,
     required this.program,
     required this.year,
     required this.section,
-    required this.defaultStatus,
+    required this.presentWindowMinutes,
+    required this.lateWindowMinutes,
     required this.createdBy,
   });
 }
@@ -180,10 +181,7 @@ class AttendanceWriteResult {
   }
 
   factory AttendanceWriteResult.failure(String message) {
-    return AttendanceWriteResult(
-      success: false,
-      message: message,
-    );
+    return AttendanceWriteResult(success: false, message: message);
   }
 }
 
@@ -265,10 +263,12 @@ class AttendanceService {
     return result;
   }
 
+  static const int lateWindowMinutes = 30;
+  static const List<int> allowedPresentWindows = [10, 20, 30];
+
   static Future<String> createSession({
     required AttendanceSessionClass selectedClass,
-    required int validityMinutes,
-    required String status,
+    required int presentWindowMinutes,
   }) async {
     final user = _auth.currentUser;
     if (user == null) {
@@ -283,46 +283,45 @@ class AttendanceService {
       );
     }
 
-    if (validityMinutes <= 0) {
+    if (!allowedPresentWindows.contains(presentWindowMinutes)) {
       throw const AttendanceServiceException(
-        'Session validity must be greater than zero minutes.',
+        'Present window must be 10, 20, or 30 minutes.',
       );
     }
 
-    final normalizedStatus = status == 'Late' ? 'Late' : 'Present';
     final now = DateTime.now();
     final date = dateString(now);
     final sessionRef = _firestore.collection('sessions').doc();
-    final expiresAt = now.add(Duration(minutes: validityMinutes));
-
-    // There should be one active session per teacher. Older active sessions
-    // are deactivated, but the new session gets its own random ID.
-    final previous = await _firestore
-        .collection('sessions')
-        .where('createdBy', isEqualTo: user.uid)
-        .get();
+    final expiresAt = now.add(
+      Duration(minutes: presentWindowMinutes + lateWindowMinutes),
+    );
 
     final batch = _firestore.batch();
-    for (final doc in previous.docs) {
-      final data = doc.data();
-      if (data['active'] == true) {
-        batch.update(doc.reference, {
-          'active': false,
-          'deactivatedAt': FieldValue.serverTimestamp(),
-        });
-      }
-    }
 
     final payload = SessionQrPayload(
-      version: 1,
+      version: 2,
       type: 'attendance_session',
       sessionId: sessionRef.id,
       date: date,
       classId: selectedClass.classId,
     );
 
+    final today = dateString(DateTime.now());
+
+    final existingSessions = await _firestore
+        .collection('sessions')
+        .where('createdBy', isEqualTo: user.uid)
+        .where('date', isEqualTo: today)
+        .where('classId', isEqualTo: selectedClass.classId)
+        .limit(1)
+        .get();
+
+    if (existingSessions.docs.isNotEmpty) {
+      throw Exception('A session for this class already exists for today.');
+    }
+
     batch.set(sessionRef, {
-      'version': 1,
+      'version': 2,
       'type': 'attendance_session',
       'sessionId': sessionRef.id,
       'date': date,
@@ -330,7 +329,8 @@ class AttendanceService {
       'program': selectedClass.program,
       'year': selectedClass.year,
       'section': selectedClass.section,
-      'defaultStatus': normalizedStatus,
+      'presentWindowMinutes': presentWindowMinutes,
+      'lateWindowMinutes': lateWindowMinutes,
       'createdBy': user.uid,
       'createdAt': FieldValue.serverTimestamp(),
       'expiresAt': Timestamp.fromDate(expiresAt),
@@ -338,7 +338,16 @@ class AttendanceService {
     });
 
     await batch.commit();
-    return payload.toJson();
+
+    // Extra fields are for the teacher UI. Student QR parsing only uses the
+    // standard payload fields above and reads timing from Firestore.
+    return jsonEncode({
+      ...jsonDecode(payload.toJson()) as Map<String, dynamic>,
+      'presentWindowMinutes': presentWindowMinutes,
+      'lateWindowMinutes': lateWindowMinutes,
+      'createdAt': now.toIso8601String(),
+      'expiresAt': expiresAt.toIso8601String(),
+    });
   }
 
   static Future<ActiveAttendanceSession?> loadActiveTeacherSession() async {
@@ -369,12 +378,18 @@ class AttendanceService {
       final sessionId = (data['sessionId'] ?? doc.id).toString();
       final type = (data['type'] ?? '').toString();
       final version = data['version'];
+      final presentWindow = (data['presentWindowMinutes'] as num?)?.toInt();
+      final lateWindow = (data['lateWindowMinutes'] as num?)?.toInt();
 
-      if (type != 'attendance_session' ||
-          (version is num ? version.toInt() : 1) != 1 ||
+      if (presentWindow == null ||
+          lateWindow == null ||
+          type != 'attendance_session' ||
+          (version is num ? version.toInt() : 1) != 2 ||
           date != _today() ||
           classId.isEmpty ||
-          sessionId.isEmpty) {
+          sessionId.isEmpty ||
+          !allowedPresentWindows.contains(presentWindow) ||
+          lateWindow != lateWindowMinutes) {
         continue;
       }
 
@@ -387,11 +402,13 @@ class AttendanceService {
       final createdAtValue = data['createdAt'];
       final createdAt = createdAtValue is Timestamp
           ? createdAtValue.toDate()
-          : expiresAt.subtract(const Duration(minutes: 15));
+          : expiresAt.subtract(
+              Duration(minutes: presentWindow + lateWindowMinutes),
+            );
 
       final candidate = ActiveAttendanceSession(
         payload: SessionQrPayload(
-          version: version is num ? version.toInt() : 1,
+          version: 2,
           type: type,
           sessionId: sessionId,
           date: date,
@@ -401,9 +418,7 @@ class AttendanceService {
         program: program,
         year: year,
         section: section,
-        status: (data['defaultStatus'] ?? 'Present').toString() == 'Late'
-            ? 'Late'
-            : 'Present',
+        presentWindowMinutes: presentWindow,
         createdAt: createdAt,
       );
 
@@ -419,9 +434,9 @@ class AttendanceService {
     SessionQrPayload payload,
     StudentProfile profile,
   ) async {
-    if (payload.version != 1) {
+    if (payload.version != 2) {
       throw const AttendanceServiceException(
-        'This QR code uses an unsupported version.',
+        'This QR code uses an unsupported version. Please generate a new session QR.',
       );
     }
 
@@ -474,14 +489,28 @@ class AttendanceService {
       );
     }
 
+    final createdAtValue = data['createdAt'];
     final expiresAtValue = data['expiresAt'];
-    if (expiresAtValue is! Timestamp) {
+    if (createdAtValue is! Timestamp || expiresAtValue is! Timestamp) {
       throw const AttendanceServiceException(
-        'This attendance session has no valid expiration time.',
+        'This attendance session has invalid timing information.',
       );
     }
 
-    if (!expiresAtValue.toDate().isAfter(DateTime.now())) {
+    final presentWindow = (data['presentWindowMinutes'] as num?)?.toInt();
+    final lateWindow = (data['lateWindowMinutes'] as num?)?.toInt();
+
+    if (presentWindow == null ||
+        lateWindow == null ||
+        !allowedPresentWindows.contains(presentWindow) ||
+        lateWindow != lateWindowMinutes) {
+      throw const AttendanceServiceException(
+        'This attendance session has invalid timing settings.',
+      );
+    }
+
+    final expiresAt = expiresAtValue.toDate();
+    if (!expiresAt.isAfter(DateTime.now())) {
       throw const AttendanceServiceException(
         'This attendance QR has expired. Ask the teacher for a new QR code.',
       );
@@ -491,7 +520,6 @@ class AttendanceService {
     final program = (data['program'] ?? '').toString();
     final year = (data['year'] ?? '').toString();
     final section = (data['section'] ?? '').toString();
-    final defaultStatus = (data['defaultStatus'] ?? 'Present').toString();
 
     if (createdBy.isEmpty ||
         program.isEmpty ||
@@ -504,13 +532,33 @@ class AttendanceService {
 
     return AttendanceSession(
       payload: payload,
-      expiresAt: expiresAtValue.toDate(),
+      createdAt: createdAtValue.toDate(),
+      expiresAt: expiresAt,
       program: program,
       year: year,
       section: section,
-      defaultStatus: defaultStatus == 'Late' ? 'Late' : 'Present',
+      presentWindowMinutes: presentWindow,
+      lateWindowMinutes: lateWindow,
       createdBy: createdBy,
     );
+  }
+
+  static String _sessionStatusForStudent({
+    required StudentProfile profile,
+    required AttendanceSession session,
+    required DateTime now,
+  }) {
+    final studentType = profile.studentType.trim();
+
+    if (studentType == 'OJT' || studentType == 'Working Student') {
+      return studentType;
+    }
+
+    final presentDeadline = session.createdAt.add(
+      Duration(minutes: session.presentWindowMinutes),
+    );
+
+    return now.isBefore(presentDeadline) ? 'Present' : 'Late';
   }
 
   static Future<AttendanceWriteResult> recordStudentSessionAttendance({
@@ -535,8 +583,8 @@ class AttendanceService {
       final session = await validateSession(payload, profile);
       final today = _today();
 
-      // Read this student's records only and detect any attendance already
-      // recorded today, including a record created by the teacher scanner.
+      // Keep the existing daily attendance behavior: once a student has an
+      // attendance record for today, another scan does not create a duplicate.
       final existing = await _firestore
           .collection('attendance')
           .where('studentId', isEqualTo: profile.studentId)
@@ -555,7 +603,11 @@ class AttendanceService {
       final now = DateTime.now();
       final attendanceId = '${profile.studentId}_$today';
       final ref = _firestore.collection('attendance').doc(attendanceId);
-      final status = session.defaultStatus;
+      final status = _sessionStatusForStudent(
+        profile: profile,
+        session: session,
+        now: now,
+      );
 
       await ref.set({
         'studentId': profile.studentId,
@@ -604,5 +656,130 @@ class AttendanceService {
         'The attendance request could not be completed.',
       );
     }
+  }
+
+  static Future<int> finalizeSessionAttendance(String sessionId) async {
+    final user = _auth.currentUser;
+    if (user == null || await AuthService.getRole(user) != 'teacher') {
+      throw const AttendanceServiceException(
+        'Only teacher accounts can finalize attendance sessions.',
+      );
+    }
+
+    final sessionRef = _firestore.collection('sessions').doc(sessionId);
+    final sessionSnap = await sessionRef.get();
+    if (!sessionSnap.exists) {
+      throw const AttendanceServiceException(
+        'The attendance session could not be found.',
+      );
+    }
+
+    final data = sessionSnap.data()!;
+    if (data['createdBy'] != user.uid) {
+      throw const AttendanceServiceException(
+        'You are not allowed to finalize this attendance session.',
+      );
+    }
+
+    if (data['active'] != true) return 0;
+
+    final expiresAtValue = data['expiresAt'];
+    if (expiresAtValue is! Timestamp ||
+        expiresAtValue.toDate().isAfter(DateTime.now())) {
+      throw const AttendanceServiceException('The session is still active.');
+    }
+
+    final date = (data['date'] ?? '').toString();
+    final program = (data['program'] ?? '').toString();
+    final year = (data['year'] ?? '').toString();
+    final section = (data['section'] ?? '').toString();
+
+    if (date.isEmpty || program.isEmpty || year.isEmpty || section.isEmpty) {
+      throw const AttendanceServiceException(
+        'The attendance session is incomplete.',
+      );
+    }
+
+    final studentsSnap = await _firestore.collection('students').get();
+    final attendanceSnap = await _firestore
+        .collection('attendance')
+        .where('date', isEqualTo: date)
+        .get();
+
+    final loggedIds = attendanceSnap.docs
+        .map((doc) => doc.data()['studentId'])
+        .whereType<String>()
+        .toSet();
+
+    final candidates = studentsSnap.docs.where((doc) {
+      final student = doc.data();
+      return student['program']?.toString() == program &&
+          student['year']?.toString() == year &&
+          student['section']?.toString() == section;
+    }).toList();
+
+    final pending = <Map<String, dynamic>>[];
+    for (final doc in candidates) {
+      final student = doc.data();
+      final studentId = doc.id;
+      if (loggedIds.contains(studentId)) continue;
+
+      final studentType = (student['studentType'] ?? 'Student').toString();
+      final status = (studentType == 'OJT' || studentType == 'Working Student')
+          ? studentType
+          : 'Absent';
+
+      final attendanceId = '${studentId}_$sessionId';
+      pending.add({
+        'ref': _firestore.collection('attendance').doc(attendanceId),
+        'data': {
+          'studentId': studentId,
+          'fullName': student['fullName'] ?? '',
+          'attendanceStatus': status,
+          'program': student['program'] ?? '',
+          'year': student['year'] ?? '',
+          'section': student['section'] ?? '',
+          'date': date,
+          'time': DateFormat('HH:mm').format(DateTime.now()),
+          'timestamp': FieldValue.serverTimestamp(),
+          'selfScanned': false,
+          'sessionId': sessionId,
+          'classId': data['classId'] ?? '',
+          'scanMethod': 'session_auto_finalize',
+        },
+      });
+    }
+
+    const chunkSize = 400;
+    for (var start = 0; start < pending.length; start += chunkSize) {
+      final batch = _firestore.batch();
+      final end = (start + chunkSize < pending.length)
+          ? start + chunkSize
+          : pending.length;
+
+      for (var i = start; i < end; i++) {
+        final item = pending[i];
+        batch.set(
+          item['ref'] as DocumentReference<Map<String, dynamic>>,
+          item['data'] as Map<String, dynamic>,
+        );
+      }
+
+      batch.update(sessionRef, {
+        'active': false,
+        'finalizedAt': FieldValue.serverTimestamp(),
+      });
+
+      await batch.commit();
+    }
+
+    if (pending.isEmpty) {
+      await sessionRef.update({
+        'active': false,
+        'finalizedAt': FieldValue.serverTimestamp(),
+      });
+    }
+
+    return pending.length;
   }
 }

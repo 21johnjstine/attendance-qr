@@ -16,7 +16,7 @@ dependencies:
   firebase_core: ^4.12.1
   cloud_firestore: ^6.7.1
   
-  mobile_scanner: ^7.4.0
+  mobile_scanner: ^7.4.2
   qr_flutter: ^4.1.0
   curved_navigation_bar: ^1.0.6
   intl: ^0.20.3

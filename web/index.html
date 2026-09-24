@@ -112,7 +112,56 @@
       <source srcset="splash/img/dark-1x.png 1x, splash/img/dark-2x.png 2x, splash/img/dark-3x.png 3x, splash/img/dark-4x.png 4x" media="(prefers-color-scheme: dark)">
       <img class="center" aria-hidden="true" src="splash/img/light-1x.png" alt="">
   </picture>
-  
+
+  <script>
+  (function () {
+    function fixCameraVideo(video) {
+      if (!video) return;
+
+      // iOS Safari: keep the camera preview inline
+      video.setAttribute("playsinline", "");
+      video.setAttribute("webkit-playsinline", "");
+
+      // Make sure Safari treats this as a live camera preview
+      video.playsInline = true;
+      video.muted = true;
+      video.autoplay = true;
+      video.controls = false;
+
+      // Don't let the video element intercept taps
+      video.style.pointerEvents = "none";
+    }
+
+    function scanForVideos(root) {
+      if (!root || !root.querySelectorAll) return;
+
+      root.querySelectorAll("video").forEach(fixCameraVideo);
+    }
+
+    // Catch videos already present
+    scanForVideos(document);
+
+    // Catch the <video> created later by mobile_scanner
+    const observer = new MutationObserver(function (mutations) {
+      for (const mutation of mutations) {
+        for (const node of mutation.addedNodes) {
+          if (node.nodeType !== 1) continue;
+
+          if (node.tagName === "VIDEO") {
+            fixCameraVideo(node);
+          }
+
+          scanForVideos(node);
+        }
+      }
+    });
+
+    observer.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+    });
+  })();
+</script>
   
   
   

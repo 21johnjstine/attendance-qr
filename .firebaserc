@@ -1,0 +1,9 @@
+{
+  "projects": {
+    "QR attendance system": "attendance-checker-47d12",
+    "default": "attendance-checker-47d12",
+    "QR attendance cheker": "attendance-checker-47d12"
+  },
+  "targets": {},
+  "etags": {}
+}

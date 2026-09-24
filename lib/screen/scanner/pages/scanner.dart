@@ -1,5 +1,7 @@
+import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
@@ -15,10 +17,7 @@ import 'package:simpleattendancechecker/services/biometric_service.dart';
 class Scanner extends StatefulWidget {
   final bool isActive;
 
-  const Scanner({
-    super.key,
-    required this.isActive,
-  });
+  const Scanner({super.key, required this.isActive});
 
   @override
   State<Scanner> createState() => _ScannerState();
@@ -38,9 +37,12 @@ class _ScannerState extends State<Scanner> {
   String? _generatedPayload;
   AttendanceSessionClass? _generatedClass;
   DateTime? _generatedExpiresAt;
+  String? _generatedSessionId;
+  Timer? _sessionTimer;
+  int _remainingSessionSeconds = 0;
   bool _isGenerating = false;
-  int _validityMinutes = 15;
-  String _generatedStatus = 'Present';
+  bool _isFinalizingSession = false;
+  int _presentWindowMinutes = 20;
 
   late Future<List<AttendanceSessionClass>> _classesFuture;
 
@@ -48,9 +50,17 @@ class _ScannerState extends State<Scanner> {
   void initState() {
     super.initState();
 
+    // On Flutter Web, use ZXing WASM for more reliable
+    // QR detection on Safari/iOS and other mobile browsers.
+    if (kIsWeb) {
+      MobileScannerPlatform.instance.setWebBarcodeReader(
+        WebBarcodeReader.zxingWasm,
+      );
+    }
+
     controller = MobileScannerController(
       formats: [BarcodeFormat.qrCode],
-      autoStart: widget.isActive,
+      autoStart: false,
     );
 
     _manualIdController.addListener(_onManualIdChanged);
@@ -60,8 +70,7 @@ class _ScannerState extends State<Scanner> {
 
   Future<void> _restoreActiveSession() async {
     try {
-      final activeSession =
-          await AttendanceService.loadActiveTeacherSession();
+      final activeSession = await AttendanceService.loadActiveTeacherSession();
 
       if (!mounted || activeSession == null) return;
 
@@ -82,9 +91,15 @@ class _ScannerState extends State<Scanner> {
         _generatedPayload = activeSession.payload.toJson();
         _generatedClass = restoredClass;
         _generatedExpiresAt = activeSession.expiresAt;
+        _generatedSessionId = activeSession.payload.sessionId;
         _selectedClassId = activeSession.payload.classId;
-        _generatedStatus = activeSession.status;
+        _presentWindowMinutes = activeSession.presentWindowMinutes;
       });
+
+      _startSessionTimer(
+        activeSession.expiresAt,
+        activeSession.payload.sessionId,
+      );
     } catch (_) {
       // No restorable active session. The Generate QR tab can create one.
     }
@@ -108,6 +123,7 @@ class _ScannerState extends State<Scanner> {
 
   @override
   void dispose() {
+    _sessionTimer?.cancel();
     controller.dispose();
     _manualIdController.dispose();
     _manualIdFocusNode.dispose();
@@ -203,8 +219,7 @@ class _ScannerState extends State<Scanner> {
           ? studentType
           : (_lateMode ? 'Late' : 'Present');
 
-      final yearDigits =
-          RegExp(r'^\d+').firstMatch(year)?.group(0) ?? '';
+      final yearDigits = RegExp(r'^\d+').firstMatch(year)?.group(0) ?? '';
       final yearSection = '$yearDigits-$section';
 
       await ScannedQrSheet.show(
@@ -231,18 +246,18 @@ class _ScannerState extends State<Scanner> {
               .collection('attendance')
               .doc(docId)
               .set({
-            'studentId': studentId,
-            'fullName': fullName,
-            'attendanceStatus': status,
-            'program': program,
-            'year': year,
-            'section': section,
-            'date': todayStr,
-            'time': DateFormat('HH:mm').format(now),
-            'timestamp': Timestamp.fromDate(now),
-            'selfScanned': false,
-            'scanMethod': 'teacher_personal_qr',
-          });
+                'studentId': studentId,
+                'fullName': fullName,
+                'attendanceStatus': status,
+                'program': program,
+                'year': year,
+                'section': section,
+                'date': todayStr,
+                'time': DateFormat('HH:mm').format(now),
+                'timestamp': Timestamp.fromDate(now),
+                'selfScanned': false,
+                'scanMethod': 'teacher_personal_qr',
+              });
         },
       );
 
@@ -357,15 +372,11 @@ class _ScannerState extends State<Scanner> {
                         .map(
                           (s) => DropdownMenuItem(
                             value: s,
-                            child: Text(
-                              s,
-                              overflow: TextOverflow.ellipsis,
-                            ),
+                            child: Text(s, overflow: TextOverflow.ellipsis),
                           ),
                         )
                         .toList(),
-                    onChanged: (v) =>
-                        setDialogState(() => selectedSection = v),
+                    onChanged: (v) => setDialogState(() => selectedSection = v),
                   ),
                 ],
               ),
@@ -433,8 +444,9 @@ class _ScannerState extends State<Scanner> {
         if (loggedIds.contains(studentId)) continue;
 
         final studentType = (data['studentType'] ?? 'Student').toString();
-        final status =
-            studentType == 'Student' ? 'Absent' : studentType;
+        final status = (studentType == 'OJT' || studentType == 'Working Student')
+            ? studentType
+            : 'Absent';
 
         final docId =
             '${studentId}_${DateFormat('yyyyMMdd_HHmmss').format(now)}';
@@ -465,8 +477,7 @@ class _ScannerState extends State<Scanner> {
 
       if (!mounted) return;
 
-      final scopeLabel =
-          isAllStudents ? 'all students' : '"$selectedSection"';
+      final scopeLabel = isAllStudents ? 'all students' : '"$selectedSection"';
 
       await _showInfoDialog(
         'Done',
@@ -485,10 +496,7 @@ class _ScannerState extends State<Scanner> {
       );
     } catch (e) {
       if (!mounted) return;
-      await _showInfoDialog(
-        'Error occurred',
-        'Could not process: $e',
-      );
+      await _showInfoDialog('Error occurred', 'Could not process: $e');
     } finally {
       if (mounted) {
         setState(() => _isMarkingAbsent = false);
@@ -500,8 +508,7 @@ class _ScannerState extends State<Scanner> {
     final program = (data['program'] ?? '').toString();
     final year = (data['year'] ?? '').toString();
     final section = (data['section'] ?? '').toString();
-    final yearDigits =
-        RegExp(r'^\d+').firstMatch(year)?.group(0) ?? '';
+    final yearDigits = RegExp(r'^\d+').firstMatch(year)?.group(0) ?? '';
 
     if (program.isEmpty && yearDigits.isEmpty && section.isEmpty) {
       return '';
@@ -515,10 +522,7 @@ class _ScannerState extends State<Scanner> {
       context: context,
       builder: (context) => AlertDialog(
         backgroundColor: Colorpalatte.maincolor,
-        title: Text(
-          title,
-          style: const TextStyle(fontFamily: 'K2D'),
-        ),
+        title: Text(title, style: const TextStyle(fontFamily: 'K2D')),
         content: Text(message),
         actions: [
           TextButton(
@@ -587,30 +591,47 @@ class _ScannerState extends State<Scanner> {
     try {
       final payload = await AttendanceService.createSession(
         selectedClass: resolvedClass,
-        validityMinutes: _validityMinutes,
-        status: _generatedStatus,
+        presentWindowMinutes: _presentWindowMinutes,
       );
 
       final parsed = jsonDecode(payload) as Map<String, dynamic>;
       final sessionId = parsed['sessionId']?.toString();
-      final expiresAtValue = parsed['expiresAt'];
-      final expiresAt = expiresAtValue is String
-          ? DateTime.tryParse(expiresAtValue) ??
-              DateTime.now().add(Duration(minutes: _validityMinutes))
-          : DateTime.now().add(Duration(minutes: _validityMinutes));
+      final expiresAtRaw = parsed['expiresAt']?.toString();
+      final parsedExpiresAt = expiresAtRaw == null
+          ? null
+          : DateTime.tryParse(expiresAtRaw);
+      final expiresAt = parsedExpiresAt ?? DateTime.now().add(
+        Duration(
+          minutes: _presentWindowMinutes +
+              AttendanceService.lateWindowMinutes,
+        ),
+      );
 
       if (!mounted) return;
 
+      _sessionTimer?.cancel();
       setState(() {
         _generatedPayload = payload;
         _generatedClass = resolvedClass;
         _generatedExpiresAt = expiresAt;
+        _generatedSessionId = sessionId;
         _selectedClassId = selectedId;
+        _remainingSessionSeconds = expiresAt
+            .difference(DateTime.now())
+            .inSeconds
+            .clamp(0, 86400)
+            .toInt();
       });
+
+      if (sessionId != null) {
+        _startSessionTimer(expiresAt, sessionId);
+      }
 
       await _showInfoDialog(
         'QR Generated',
-        'Session ${sessionId ?? ''} is now active for ${resolvedClass.label} until ${DateFormat('hh:mm a').format(expiresAt)}.',
+        'Present window: $_presentWindowMinutes minutes. ' +
+            'Late window: additional ${AttendanceService.lateWindowMinutes} minutes. ' +
+            'Session ends at ${DateFormat('hh:mm a').format(expiresAt)}.',
       );
     } on AttendanceServiceException catch (e) {
       if (!mounted) return;
@@ -620,20 +641,74 @@ class _ScannerState extends State<Scanner> {
       await _showInfoDialog(
         'Could not generate QR',
         e.code == 'permission-denied'
-            ? 'Firestore denied session creation. Check the teacher role and Firestore rules.'
+            ? 'Session for this class already exists for today.'
             : e.message ?? 'The session could not be created.',
       );
-    } catch (_) {
+    } catch (e) {
       if (!mounted) return;
       await _showInfoDialog(
         'Could not generate QR',
-        'The attendance session could not be created.',
+        'The attendance session could not be created: $e',
       );
     } finally {
       if (mounted) {
         setState(() => _isGenerating = false);
       }
     }
+  }
+
+  void _startSessionTimer(DateTime expiresAt, String sessionId) {
+    _sessionTimer?.cancel();
+
+    void tick() {
+      if (!mounted) return;
+
+      final seconds = expiresAt.difference(DateTime.now()).inSeconds;
+      if (seconds <= 0) {
+        _sessionTimer?.cancel();
+        setState(() => _remainingSessionSeconds = 0);
+        _finalizeSessionIfExpired(sessionId);
+        return;
+      }
+
+      setState(() => _remainingSessionSeconds = seconds);
+    }
+
+    tick();
+    _sessionTimer = Timer.periodic(
+      const Duration(seconds: 1),
+      (_) => tick(),
+    );
+  }
+
+  Future<void> _finalizeSessionIfExpired(String sessionId) async {
+    if (_isFinalizingSession) return;
+    _isFinalizingSession = true;
+
+    try {
+      await AttendanceService.finalizeSessionAttendance(sessionId);
+      if (mounted) {
+        setState(() {});
+      }
+    } catch (_) {
+      // The scheduled Firebase function is the server-side fallback when
+      // the teacher app cannot finalize the session itself.
+    } finally {
+      _isFinalizingSession = false;
+    }
+  }
+
+  String _formatRemaining(int seconds) {
+    final safe = seconds < 0 ? 0 : seconds;
+    final hours = safe ~/ 3600;
+    final minutes = (safe % 3600) ~/ 60;
+    final secs = safe % 60;
+
+    if (hours > 0) {
+      return '${hours.toString().padLeft(2, '0')}:${minutes.toString().padLeft(2, '0')}:${secs.toString().padLeft(2, '0')}';
+    }
+
+    return '${minutes.toString().padLeft(2, '0')}:${secs.toString().padLeft(2, '0')}';
   }
 
   Widget _buildTabs() {
@@ -679,9 +754,7 @@ class _ScannerState extends State<Scanner> {
         duration: const Duration(milliseconds: 180),
         alignment: Alignment.center,
         decoration: BoxDecoration(
-          color: selected
-              ? Colorpalatte.secondary
-              : Colors.transparent,
+          color: selected ? Colorpalatte.secondary : Colors.transparent,
           borderRadius: BorderRadius.circular(AppRadius.sm),
         ),
         child: Row(
@@ -690,9 +763,7 @@ class _ScannerState extends State<Scanner> {
             Icon(
               icon,
               size: 19,
-              color: selected
-                  ? Colorpalatte.maincolor
-                  : Colorpalatte.secondary,
+              color: selected ? Colorpalatte.maincolor : Colorpalatte.secondary,
             ),
             const SizedBox(width: AppSpacing.xs),
             Text(
@@ -723,10 +794,7 @@ class _ScannerState extends State<Scanner> {
             decoration: BoxDecoration(
               borderRadius: BorderRadius.circular(AppRadius.lg),
               gradient: const LinearGradient(
-                colors: [
-                  Colorpalatte.ojtcolor,
-                  Colorpalatte.secondary,
-                ],
+                colors: [Colorpalatte.ojtcolor, Colorpalatte.secondary],
               ),
             ),
             child: ClipRRect(
@@ -739,10 +807,7 @@ class _ScannerState extends State<Scanner> {
                   );
                   final cutoutSize = size.shortestSide * 0.6;
                   final scanWindow = Rect.fromCenter(
-                    center: Offset(
-                      size.width / 2,
-                      size.height / 2,
-                    ),
+                    center: Offset(size.width / 2, size.height / 2),
                     width: cutoutSize,
                     height: cutoutSize,
                   );
@@ -798,14 +863,12 @@ class _ScannerState extends State<Scanner> {
                   ValueListenableBuilder(
                     valueListenable: controller,
                     builder: (context, state, _) {
-                      final torchOn =
-                          state.torchState == TorchState.on;
+                      final torchOn = state.torchState == TorchState.on;
 
                       return Row(
                         children: [
                           IconButton(
-                            onPressed: () =>
-                                controller.toggleTorch(),
+                            onPressed: () => controller.toggleTorch(),
                             icon: Icon(
                               torchOn
                                   ? Icons.bolt_rounded
@@ -815,8 +878,7 @@ class _ScannerState extends State<Scanner> {
                                 ? Colorpalatte.accentcolor
                                 : Colorpalatte.mutedcolor,
                             style: IconButton.styleFrom(
-                              backgroundColor:
-                                  Colorpalatte.maincolor,
+                              backgroundColor: Colorpalatte.maincolor,
                               shape: const CircleBorder(),
                             ),
                           ),
@@ -850,10 +912,8 @@ class _ScannerState extends State<Scanner> {
                       ),
                       Switch(
                         value: _lateMode,
-                        activeThumbColor:
-                            Colorpalatte.errorcolor,
-                        onChanged: (v) =>
-                            setState(() => _lateMode = v),
+                        activeThumbColor: Colorpalatte.errorcolor,
+                        onChanged: (v) => setState(() => _lateMode = v),
                       ),
                     ],
                   ),
@@ -872,16 +932,14 @@ class _ScannerState extends State<Scanner> {
                   filled: true,
                   fillColor: Colorpalatte.maincolor,
                   border: OutlineInputBorder(
-                    borderRadius:
-                        BorderRadius.circular(AppRadius.md),
+                    borderRadius: BorderRadius.circular(AppRadius.md),
                     borderSide: BorderSide.none,
                   ),
                 ),
               ),
               const SizedBox(height: AppSpacing.sm),
               ElevatedButton.icon(
-                onPressed:
-                    _isMarkingAbsent ? null : _markAbsentees,
+                onPressed: _isMarkingAbsent ? null : _markAbsentees,
                 icon: _isMarkingAbsent
                     ? const SizedBox(
                         height: 16,
@@ -896,28 +954,19 @@ class _ScannerState extends State<Scanner> {
                         color: Colorpalatte.errorcolor,
                       ),
                 label: Text(
-                  _isMarkingAbsent
-                      ? 'Marking...'
-                      : 'Mark as Absent',
-                  style: const TextStyle(
-                    color: Colorpalatte.errorcolor,
-                  ),
+                  _isMarkingAbsent ? 'Marking...' : 'Mark as Absent',
+                  style: const TextStyle(color: Colorpalatte.errorcolor),
                 ),
                 style: ElevatedButton.styleFrom(
-                  backgroundColor:
-                      Colorpalatte.errorcolor.withValues(alpha: 0.1),
+                  backgroundColor: Colorpalatte.errorcolor.withValues(
+                    alpha: 0.1,
+                  ),
                   foregroundColor: Colorpalatte.errorcolor,
                   elevation: 0,
-                  padding: const EdgeInsets.symmetric(
-                    vertical: AppSpacing.sm,
-                  ),
+                  padding: const EdgeInsets.symmetric(vertical: AppSpacing.sm),
                   shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(
-                      AppRadius.md,
-                    ),
-                    side: const BorderSide(
-                      color: Colorpalatte.errorcolor,
-                    ),
+                    borderRadius: BorderRadius.circular(AppRadius.md),
+                    side: const BorderSide(color: Colorpalatte.errorcolor),
                   ),
                 ),
               ),
@@ -945,8 +994,7 @@ class _ScannerState extends State<Scanner> {
                 'The teacher class list could not be loaded. Check Firestore permissions and your connection.',
             onRetry: () {
               setState(() {
-                _classesFuture =
-                    AttendanceService.loadTeacherClasses();
+                _classesFuture = AttendanceService.loadTeacherClasses();
               });
             },
           );
@@ -1003,8 +1051,7 @@ class _ScannerState extends State<Scanner> {
                   filled: true,
                   fillColor: Colorpalatte.containercolor,
                   border: OutlineInputBorder(
-                    borderRadius:
-                        BorderRadius.circular(AppRadius.md),
+                    borderRadius: BorderRadius.circular(AppRadius.md),
                     borderSide: BorderSide.none,
                   ),
                 ),
@@ -1022,88 +1069,52 @@ class _ScannerState extends State<Scanner> {
                 onChanged: (value) {
                   setState(() {
                     _selectedClassId = value;
+                    _sessionTimer?.cancel();
                     _generatedPayload = null;
                     _generatedClass = null;
                     _generatedExpiresAt = null;
+                    _generatedSessionId = null;
+                    _remainingSessionSeconds = 0;
                   });
                 },
               ),
               const SizedBox(height: AppSpacing.sm),
-              Row(
-                children: [
-                  Expanded(
-                    child: DropdownButtonFormField<int>(
-                      initialValue: _validityMinutes,
-                      decoration: InputDecoration(
-                        labelText: 'Validity',
-                        filled: true,
-                        fillColor: Colorpalatte.containercolor,
-                        border: OutlineInputBorder(
-                          borderRadius:
-                              BorderRadius.circular(AppRadius.md),
-                          borderSide: BorderSide.none,
-                        ),
-                      ),
-                      items: const [
-                        DropdownMenuItem(
-                          value: 5,
-                          child: Text('5 minutes'),
-                        ),
-                        DropdownMenuItem(
-                          value: 15,
-                          child: Text('15 minutes'),
-                        ),
-                        DropdownMenuItem(
-                          value: 30,
-                          child: Text('30 minutes'),
-                      ),
-                    ],
-                    onChanged: (value) {
-                      if (value == null) return;
-                      setState(() => _validityMinutes = value);
-                    },
-                    ),
+              DropdownButtonFormField<int>(
+                initialValue: _presentWindowMinutes,
+                decoration: InputDecoration(
+                  labelText: 'Present window',
+                  filled: true,
+                  fillColor: Colorpalatte.containercolor,
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(AppRadius.md),
+                    borderSide: BorderSide.none,
                   ),
-                  const SizedBox(width: AppSpacing.sm),
-                  Expanded(
-                    child: DropdownButtonFormField<String>(
-                      initialValue: _generatedStatus,
-                      decoration: InputDecoration(
-                        labelText: 'Status',
-                        filled: true,
-                        fillColor: Colorpalatte.containercolor,
-                        border: OutlineInputBorder(
-                          borderRadius:
-                              BorderRadius.circular(AppRadius.md),
-                          borderSide: BorderSide.none,
-                        ),
-                      ),
-                      items: const [
-                        DropdownMenuItem(
-                          value: 'Present',
-                          child: Text('Present'),
-                        ),
-                        DropdownMenuItem(
-                          value: 'Late',
-                          child: Text('Late'),
-                        ),
-                      ],
-                      onChanged: (value) {
-                        if (value == null) return;
-                        setState(() => _generatedStatus = value);
-                      },
-                    ),
-                  ),
+                ),
+                items: const [
+                  DropdownMenuItem(value: 10, child: Text('10 minutes')),
+                  DropdownMenuItem(value: 20, child: Text('20 minutes')),
+                  DropdownMenuItem(value: 30, child: Text('30 minutes')),
                 ],
+                onChanged: (value) {
+                  if (value == null) return;
+                  setState(() => _presentWindowMinutes = value);
+                },
+              ),
+              const SizedBox(height: AppSpacing.xs),
+              Text(
+                'After the present window, students have an additional ${AttendanceService.lateWindowMinutes} minutes to be marked Late. After that, the session closes and remaining students are automatically finalized.',
+                style: const TextStyle(
+                  fontSize: AppFontSize.caption,
+                  color: Colorpalatte.mutedcolor,
+                  height: 1.35,
+                ),
               ),
               const SizedBox(height: AppSpacing.md),
               SizedBox(
                 width: double.infinity,
                 height: 50,
                 child: ElevatedButton.icon(
-                  onPressed: _isGenerating
-                      ? null
-                      : _generateSessionQr,
+                  onPressed: _isGenerating ? null : _generateSessionQr,
                   icon: _isGenerating
                       ? const SizedBox(
                           width: 20,
@@ -1115,17 +1126,14 @@ class _ScannerState extends State<Scanner> {
                         )
                       : const Icon(Icons.qr_code_2_rounded),
                   label: Text(
-                    _isGenerating
-                        ? 'Generating...'
-                        : 'Generate QR Code',
+                    _isGenerating ? 'Generating...' : 'Generate QR Code',
                   ),
                   style: ElevatedButton.styleFrom(
                     backgroundColor: Colorpalatte.secondary,
                     foregroundColor: Colorpalatte.maincolor,
                     elevation: 0,
                     shape: RoundedRectangleBorder(
-                      borderRadius:
-                          BorderRadius.circular(AppRadius.md),
+                      borderRadius: BorderRadius.circular(AppRadius.md),
                     ),
                   ),
                 ),
@@ -1134,9 +1142,7 @@ class _ScannerState extends State<Scanner> {
               if (_generatedPayload != null &&
                   _generatedClass != null &&
                   _generatedExpiresAt != null)
-                _buildGeneratedQrCard(
-                  selected: selected ?? _generatedClass!,
-                )
+                _buildGeneratedQrCard(selected: selected ?? _generatedClass!)
               else
                 _buildGeneratorPlaceholder(),
             ],
@@ -1188,11 +1194,13 @@ class _ScannerState extends State<Scanner> {
     );
   }
 
-  Widget _buildGeneratedQrCard({
-    required AttendanceSessionClass selected,
-  }) {
+  Widget _buildGeneratedQrCard({required AttendanceSessionClass selected}) {
     final expiresAt = _generatedExpiresAt!;
     final expired = !expiresAt.isAfter(DateTime.now());
+    final presentUntil = expiresAt.subtract(
+      const Duration(minutes: AttendanceService.lateWindowMinutes),
+    );
+    final remaining = _remainingSessionSeconds;
 
     return Container(
       width: double.infinity,
@@ -1209,9 +1217,9 @@ class _ScannerState extends State<Scanner> {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Text(
-                      'Active Session',
-                      style: TextStyle(
+                    Text(
+                      expired ? 'Session Ended' : 'Active Session',
+                      style: const TextStyle(
                         fontFamily: 'K2D',
                         fontSize: AppFontSize.subtitle,
                         fontWeight: FontWeight.w700,
@@ -1230,18 +1238,14 @@ class _ScannerState extends State<Scanner> {
                 ),
               ),
               Icon(
-                expired
-                    ? Icons.timer_off_rounded
-                    : Icons.timer_rounded,
+                expired ? Icons.timer_off_rounded : Icons.timer_rounded,
                 color: expired
                     ? Colorpalatte.errorcolor
                     : Colorpalatte.accentcolor,
               ),
               const SizedBox(width: AppSpacing.xs),
               Text(
-                expired
-                    ? 'Expired'
-                    : 'Until ${DateFormat('hh:mm a').format(expiresAt)}',
+                expired ? 'Expired' : _formatRemaining(remaining),
                 style: TextStyle(
                   fontFamily: 'K2D',
                   fontSize: AppFontSize.caption,
@@ -1249,6 +1253,24 @@ class _ScannerState extends State<Scanner> {
                   color: expired
                       ? Colorpalatte.errorcolor
                       : Colorpalatte.secondary,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: AppSpacing.sm),
+          Row(
+            children: [
+              Expanded(
+                child: _sessionWindowChip(
+                  'Present',
+                  DateFormat('hh:mm a').format(presentUntil),
+                ),
+              ),
+              const SizedBox(width: AppSpacing.xs),
+              Expanded(
+                child: _sessionWindowChip(
+                  'Late',
+                  DateFormat('hh:mm a').format(expiresAt),
                 ),
               ),
             ],
@@ -1270,14 +1292,48 @@ class _ScannerState extends State<Scanner> {
           const SizedBox(height: AppSpacing.md),
           Text(
             expired
-                ? 'This QR is no longer valid. Generate a new session.'
-                : 'Ask students to scan this QR from their Student POV.',
+                ? 'This QR is no longer valid. Remaining students have been finalized automatically.'
+                : 'Ask students to scan this QR. The first ${_presentWindowMinutes} minutes are Present, followed by ${AttendanceService.lateWindowMinutes} minutes for Late.',
             textAlign: TextAlign.center,
             style: TextStyle(
               fontSize: AppFontSize.caption,
               color: expired
                   ? Colorpalatte.errorcolor
                   : Colorpalatte.mutedcolor,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _sessionWindowChip(String label, String time) {
+    return Container(
+      padding: const EdgeInsets.symmetric(
+        horizontal: AppSpacing.sm,
+        vertical: AppSpacing.xs,
+      ),
+      decoration: BoxDecoration(
+        color: Colorpalatte.maincolor,
+        borderRadius: BorderRadius.circular(AppRadius.sm),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            label,
+            style: const TextStyle(
+              fontFamily: 'K2D',
+              fontSize: AppFontSize.caption,
+              fontWeight: FontWeight.w700,
+              color: Colorpalatte.secondary,
+            ),
+          ),
+          Text(
+            'until $time',
+            style: const TextStyle(
+              fontSize: 11,
+              color: Colorpalatte.mutedcolor,
             ),
           ),
         ],

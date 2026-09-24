@@ -147,8 +147,9 @@ class _RecordListState extends State<RecordList> {
           final rawYear = (d['year'] ?? '').toString().trim();
           final yearDigits = _yearDigits(rawYear);
           final section = (d['section'] ?? '').toString().trim();
-          if (program.isEmpty || yearDigits.isEmpty || section.isEmpty)
+          if (program.isEmpty || yearDigits.isEmpty || section.isEmpty) {
             continue;
+          }
 
           programs.add(program);
           years.add(yearDigits);

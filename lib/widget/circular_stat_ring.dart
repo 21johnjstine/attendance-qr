@@ -33,7 +33,7 @@ class CircularStatRing extends StatelessWidget {
             child: CircularProgressIndicator(
               value: clamped / 100,
               strokeWidth: strokeWidth,
-              backgroundColor: color.withOpacity(0.15),
+              backgroundColor: color.withValues(alpha: 0.15),
               valueColor: AlwaysStoppedAnimation<Color>(color),
               strokeCap: StrokeCap.round,
             ),
